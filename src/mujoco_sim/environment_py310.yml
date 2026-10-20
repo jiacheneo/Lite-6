@@ -1,0 +1,31 @@
+name: env550lab
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python = 3.10
+  - pinocchio = 3.8.0   # pulls in conda casadi 3.7.2, but missing solvers (see pip install override below)
+  - scipy = 1.15.3
+  - websocket-client = 1.8.0
+  - numpy = 2.0.1
+  - glib = 2.84.2
+  - pip = 25.2
+  - pip:
+    - mujoco == 3.3.7
+    - lcm == 1.5.1
+    - proxsuite == 0.7.3   # dense QP behind the Cartesian-jog velocity IK
+    - casadi == 3.7.2
+    # for the full solver set (qpOASES/Sundials/CSparse), after `conda env create ...` run:
+    # pip install --ignore-installed --no-deps casadi==3.7.2
+    # Control station GUI + vision. install_camera.sh still apt-installs
+    # python3-pyqt5, but only for the Qt xcb runtime libs it drags in --
+    # /usr/lib/python3/dist-packages is not on a conda env's sys.path, so the GUI
+    # imports this PyQt5. See install_scripts/README.md.
+    - pyqt5 == 5.15.11
+    - xarm-python-sdk == 1.18.4
+    - pupil-apriltags == 1.0.4.post11
+    # headless: no bundled Qt, so it cannot clash with PyQt5's plugin loader.
+    # cv2.imshow is unavailable; all image processing works and display goes
+    # through PyQt5. Pinned to 4.x -- unpinned resolves to opencv 5.x.
+    - opencv-python-headless == 4.10.0.84
+    - matplotlib == 3.10.8  # Task 3.5 PNG/PDF measurement reports

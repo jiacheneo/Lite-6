@@ -1,0 +1,199 @@
+import mujoco
+import numpy as np
+
+from .lcm2mujoco_bridge import Lcm2MujocoBridge
+from lite6_sim.lcm_msgs import ufactory_lite6_display_t
+from lite6_sim.utils import *
+
+
+class UfactoryLite6Bridge(Lcm2MujocoBridge):
+    def __init__(self, mj_model, mj_data, config):
+        launch_args = getattr(config, "launch_args", None)
+        in_replay_mode = bool(getattr(launch_args, "replay", False))
+        if in_replay_mode:
+            config.lcm_udp_multicast_group = "udpm://239.255.76.67:7667?ttl=0"
+        super().__init__(mj_model, mj_data, config)
+        self.in_replay_mode = in_replay_mode
+        self.ee_body_id = mujoco.mj_name2id(self.mj_model, mujoco._enums.mjtObj.mjOBJ_BODY, "link6")
+
+        # Internal desired trajectory state. Shaped by the incoming speed/mvacc limits
+        # and written straight to mj_data.ctrl, which the position actuators servo to.
+        self._q_des = None                          # desired joint position (nv,)
+        self._qd_des = np.zeros(self.mj_model.nv)   # desired joint velocity (nv,)
+
+        # Cartesian jog (mode 2): velocity IK on a scratch MjData, so the Jacobian is
+        # evaluated at the commanded configuration and the solver integrates its own
+        # state instead of chasing sensor noise.
+        self._ik_solver = DifferentialIKSolver(self.mj_model.jnt_range[:, 0],
+                                               self.mj_model.jnt_range[:, 1])
+        self._ik_data = mujoco.MjData(self.mj_model)
+
+        # Display overlays driven by the upper-level GUI over the display msg LCM channel.
+        # Only the raw values are stored here; main.py owns the rendering so the
+        # scene geometry is built on the viewer thread rather than the LCM thread.
+        self.vis_ghost_q = np.zeros(6)              # ghost arm joint angles (rad)
+        self.vis_fk_pos = np.zeros(3)               # FK marker position (m, world)
+        self.vis_fk_R = np.eye(3)                   # FK marker orientation
+        self.vis_fk_box_size = [0.025, 0.025, 0.025]
+        self.lc.subscribe(config.robot_display_topic, self.lcm_display_handler)
+
+    def lcm_display_handler(self, channel, data):
+        # Upper-level display request: ghost arm (IK preview) and FK pose marker.
+        msg = ufactory_lite6_display_t.decode(data)
+        self.vis_ghost = bool(msg.show_ghost)
+        if self.vis_ghost:
+            self.vis_ghost_q = np.array(msg.ghost_qj_pos, dtype=float)
+        self.vis_fk = bool(msg.show_fk)
+        if self.vis_fk:
+            self.vis_fk_pos = np.array(msg.fk_pos, dtype=float)
+            # rpy_to_quat/quat_to_rot use the same fixed-axis RPY convention as
+            # the upper level's get_pose_from_T, so no extra conversion is needed.
+            self.vis_fk_R = quat_to_rot(rpy_to_quat(np.array(msg.fk_rpy, dtype=float)))
+
+    def parse_robot_specific_low_state(self):
+        # Joint-space inertia matrix
+        temp_inertia_mat = np.zeros((self.mj_model.nv, self.mj_model.nv))
+        mujoco.mj_fullM(self.mj_model, temp_inertia_mat, self.mj_data.qM)
+        self.low_state.inertia_mat = temp_inertia_mat.tolist()
+        self.low_state.bias_force = self.mj_data.qfrc_bias.tolist()
+
+        # End-effector translational Jacobian and its time-derivative-times-qvel
+        ee_pos = self.mj_data.xpos[self.ee_body_id]
+        J_ee = np.zeros((3, self.mj_model.nv))
+        mujoco.mj_jac(self.mj_model, self.mj_data, J_ee, None, ee_pos, self.ee_body_id)
+
+        dJ_ee = np.zeros((3, self.mj_model.nv))
+        mujoco.mj_jacDot(self.mj_model, self.mj_data, dJ_ee, None, ee_pos, self.ee_body_id)
+        dJdq_ee = dJ_ee @ self.low_state.qj_vel
+
+        self.low_state.J_ee = J_ee.tolist()
+        self.low_state.dJdq_ee = dJdq_ee.tolist()
+        self.low_state.p_ee = ee_pos.tolist()
+
+    @staticmethod
+    def _rate_limit(v_prev, v_target, accel_limit, dt):
+        # Move v_prev toward v_target with per-element |delta v| <= accel_limit*dt.
+        v_prev = np.asarray(v_prev, dtype=float)
+        v_target = np.asarray(v_target, dtype=float)
+        if accel_limit <= 0.0 or dt <= 0.0:
+            return v_target.copy()  # no accel limit -> jump straight to target velocity
+        dv = np.clip(v_target - v_prev, -accel_limit * dt, accel_limit * dt)
+        return v_prev + dv
+
+    def _servo_profile(self, q_des, qd_des, q_target, v_max, a_max, dt):
+        # Trapezoidal (velocity/accel-limited) follower toward q_target.
+        # Returns the next (q_des, qd_des); decelerates so it stops cleanly at the target.
+        q_des = np.asarray(q_des, dtype=float)
+        qd_des = np.asarray(qd_des, dtype=float)
+        q_target = np.asarray(q_target, dtype=float)
+        err = q_target - q_des
+        # Fastest speed from which we can still brake to a stop within |err|.
+        v_stop = np.sqrt(2.0 * max(a_max, 1e-9) * np.abs(err))
+        v_cmd = np.sign(err) * np.minimum(v_max, v_stop)
+        qd_new = self._rate_limit(qd_des, v_cmd, a_max, dt)
+        q_new = q_des + qd_new * dt
+        # Snap when essentially there to avoid dithering around the target.
+        close = np.abs(q_target - q_new) < 1e-4
+        q_new = np.where(close, q_target, q_new)
+        qd_new = np.where(close, 0.0, qd_new)
+        return q_new, qd_new
+
+    def _ee_jacobian(self, q):
+        # 6 x nv end-effector Jacobian [v; w] at configuration q, in the world frame,
+        # plus the end-effector rotation. Evaluated on the scratch MjData so the live
+        # simulation state is untouched.
+        self._ik_data.qpos[:self.mj_model.nu] = q
+        mujoco.mj_kinematics(self.mj_model, self._ik_data)
+        mujoco.mj_comPos(self.mj_model, self._ik_data)
+        jacp = np.zeros((3, self.mj_model.nv))
+        jacr = np.zeros((3, self.mj_model.nv))
+        ee_pos = self._ik_data.xpos[self.ee_body_id]
+        mujoco.mj_jac(self.mj_model, self._ik_data, jacp, jacr, ee_pos, self.ee_body_id)
+        R_ee = np.array(self._ik_data.xmat[self.ee_body_id]).reshape(3, 3)
+        return np.vstack([jacp, jacr]), R_ee
+
+    def _cartesian_step(self, cmd, dt):
+        # Cartesian jog: map the commanded end-effector twist to joint velocities by
+        # velocity IK, then integrate. This is the sim's stand-in for the real arm's
+        # firmware mode 5, so the upper level only ever streams a twist.
+        J, R_ee = self._ee_jacobian(self._q_des)
+        twist = np.asarray(cmd.v_ee, dtype=float)
+        if bool(getattr(cmd, "ee_frame", False)):
+            # Tool frame -> world. Linear and angular blocks rotate the same way.
+            twist = np.hstack([R_ee @ twist[:3], R_ee @ twist[3:]])
+
+        qd_target = self._ik_solver.solve(J, twist, self._q_des, dt, qd_limit=cmd.speed)
+        if qd_target is None:
+            qd_target = np.zeros(self.mj_model.nu)  # unsolvable: hold instead of guessing
+
+        # Same accel limiting as the joint jog, so starts and stops are not steps.
+        qd_des = self._rate_limit(self._qd_des, qd_target, cmd.mvacc, dt)
+        return self._q_des + qd_des * dt, qd_des
+
+    def update_motor_cmd(self):
+        # Position control: mj_data.ctrl is a joint angle target and the <position>
+        # actuators in the XML close the servo loop. All this has to do is shape the
+        # desired trajectory (q_des) from the incoming command and its speed/mvacc limits.
+        nu = self.mj_model.nu
+        lo = self.mj_model.actuator_ctrlrange[:, 0]   # = joint travel limits
+        hi = self.mj_model.actuator_ctrlrange[:, 1]
+        dt = self.dt
+
+        have_live_cmd = True
+        if self._lcm_cmd_daemon is not None:
+            self._lcm_cmd_daemon.update()
+            self._print_lcm_cmd_daemon()
+            if self._lcm_cmd_daemon.is_error():
+                have_live_cmd = False
+
+        # Init the internal desired state from the current configuration.
+        if self._q_des is None:
+            self._q_des = np.array(self.mj_data.qpos[:nu], dtype=float)
+            self._qd_des = np.zeros(nu)
+
+        if not have_live_cmd:
+            # No fresh command: hold the last desired pose.
+            self._qd_des = np.zeros(nu)
+            self.mj_data.ctrl[:] = np.clip(self._q_des, lo, hi)
+            return
+
+        cmd = self._compute_delayed_low_cmd()
+        mode = int(getattr(cmd, "mode", 0))
+        speed = float(getattr(cmd, "speed", 0.0))
+        mvacc = float(getattr(cmd, "mvacc", 0.0))
+
+        if mode == 2:
+            # Cartesian velocity / jog.
+            q_des, qd_des = self._cartesian_step(cmd, dt)
+        elif mode == 1:
+            # Joint velocity / jog: ramp desired velocity toward cmd.qj_vel under mvacc, integrate.
+            qd_target = np.asarray(cmd.qj_vel, dtype=float)
+            if speed > 0.0:
+                qd_target = np.clip(qd_target, -speed, speed)
+            qd_des = self._rate_limit(self._qd_des, qd_target, mvacc, dt)
+            q_des = self._q_des + qd_des * dt
+        elif speed <= 0.0:
+            # Position mode, no speed limit: track the target directly (backward compatible).
+            q_des = np.asarray(cmd.qj_pos, dtype=float)
+            qd_des = np.zeros(nu)
+        else:
+            # Position / servo: velocity/accel-limited trapezoidal move toward cmd.qj_pos.
+            q_des, qd_des = self._servo_profile(self._q_des, self._qd_des, cmd.qj_pos, speed, mvacc, dt)
+
+        self._q_des = np.clip(q_des, lo, hi)
+        self._qd_des = qd_des
+        self.mj_data.ctrl[:] = self._q_des
+
+    def lcm_state_handler(self, channel, data):
+        if self.mj_data is None:
+            return
+        # In replay mode, parse_common_low_state is skipped on the sim thread, so there is no race over low_state.qj_*
+        msg = self.low_state_type.decode(data)
+
+        # Update mj_data for visualization
+        self.mj_data.qpos[:6] = msg.qj_pos
+        self.mj_data.qvel[:] = 0
+        self.mj_data.act[:] = False
+        self.mj_data.qacc_warmstart[:] = 0
+        # ctrl is a joint angle target under position control
+        self.mj_data.ctrl[:] = msg.qj_pos

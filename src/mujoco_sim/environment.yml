@@ -1,0 +1,15 @@
+name: env550lab
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python = 3.9
+  - numpy = 1.26.4
+  - scipy = 1.13.1
+  - pinocchio = 3.7.0
+  - glib = 2.84.2
+  - pip = 25.1
+  - pip:
+    - mujoco == 3.3.4
+    - lcm == 1.5.1
+    - casadi == 3.7.0

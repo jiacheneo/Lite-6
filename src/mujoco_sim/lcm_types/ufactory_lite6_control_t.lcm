@@ -1,0 +1,32 @@
+package lcm_msgs;
+
+struct ufactory_lite6_control_t
+{
+    int64_t  timestamp;
+
+    const int32_t num_joint=6;
+
+    // Control mode: 
+    //  0 = position/servo (target = qj_pos),
+    //  1 = joint velocity/jog (target = qj_vel),
+    //  2 = Cartesian velocity/jog (target = v_ee)
+    int8_t   mode;
+
+    // Trajectory shaping limits. Scalars.
+    double   speed;   // max joint speed (rad/s); <=0 means: no limit / track target directly in servo mode
+    double   mvacc;   // max joint acceleration (rad/s^2)
+
+    // Tau, kp, kd is currently unused by the Lite 6 bridge: the MuJoCo model is position-controlled,
+    // so the servo gains live in the XML. Kept for the generic torque bridge and a possible torque lab.
+    double   qj_tau[num_joint];
+
+    double   qj_pos[num_joint];
+    double   qj_vel[num_joint];
+
+    double   kp[num_joint];
+    double   kd[num_joint];
+
+    // For mode 2 only: end-effector twist [vx, vy, vz, wx, wy, wz] in m/s and rad/s.
+    double   v_ee[6];
+    boolean  ee_frame; // true = tool frame, false = base/world frame
+}

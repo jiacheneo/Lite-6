@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mujoco-sim"
+version = "0.4.0"
+requires-python = ">=3.8"
+readme = "README.md"
+authors = [
+    {name = "Yulun Zhuang", email = "yulunz@umich.edu"},
+    {name = "Yue Qin", email = "yueqin@umich.edu"},
+    {name = "Zelin Shen", email = "zelin@umich.edu"},
+]
+description = "Software bridge of a nominal robot controller to Mujoco simulator via LCM communication"
+dependencies = [
+    "numpy",
+    "scipy",
+    "lcm",
+    "mujoco",
+]
+
+
+[project.optional-dependencies]
+kindyn = [
+    "pinocchio"
+]
+
+
+[project.urls]
+Repository = "https://github.com/ARCaD-Lab-UM/arc-bridge"
+
+
+[project.scripts]
+mujoco-sim = "lite6_sim.main:main"
+550-lcm-spy = "lite6_sim.run_lcm_spy:main"
+
+
+[tool.setuptools]
+packages = [
+    "lite6_sim",
+    "lite6_sim.bridges",
+    "lite6_sim.lcm_msgs",
+    "lite6_sim.utils",
+]
